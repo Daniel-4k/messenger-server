@@ -16,7 +16,9 @@ const PORT = process.env.PORT || 3000;
 
 const app = express();
 app.use(express.json({ limit: "12mb" })); // фото/аудио идут как base64, нужен запас
-app.use(express.static(path.join(__dirname, "public")));
+app.get("/", (req, res) => res.sendFile(path.join(__dirname, "index.html")));
+app.get("/index.html", (req, res) => res.sendFile(path.join(__dirname, "index.html")));
+app.get("/script.js", (req, res) => res.sendFile(path.join(__dirname, "script.js")));
 app.use("/uploads", express.static(UPLOADS_DIR));
 
 const server = http.createServer(app);
