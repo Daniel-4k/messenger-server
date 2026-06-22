@@ -10,12 +10,16 @@ const fs = require("fs");
 const crypto = require("crypto");
 const { WebSocketServer } = require("ws");
 const { nanoid } = require("nanoid");
-const { state, save, chatIdFor, UPLOADS_DIR } = require("./db");
+const { state, save, chatIdFor, groupChatId, UPLOADS_DIR, ready } = require("./db");
 
 const PORT = process.env.PORT || 3000;
 
 const app = express();
 app.use(express.json({ limit: "12mb" })); // фото/аудио идут как base64, нужен запас
+
+// Раздаём только сам клиент (index.html, script.js), а не всю папку
+// проекта — иначе через браузер был бы виден исходный код server.js,
+// db.js и содержимое package.json.
 app.get("/", (req, res) => res.sendFile(path.join(__dirname, "index.html")));
 app.get("/index.html", (req, res) => res.sendFile(path.join(__dirname, "index.html")));
 app.get("/script.js", (req, res) => res.sendFile(path.join(__dirname, "script.js")));
@@ -24,7 +28,6 @@ app.use("/uploads", express.static(UPLOADS_DIR));
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/ws" });
 
-// phone -> WebSocket  (кто сейчас онлайн и через какое соединение с ним говорить)
 const liveSockets = new Map();
 
 function publicUser(u) {
@@ -36,6 +39,18 @@ function publicUser(u) {
     color: u.color || "#2DD4A8",
     avatarUrl: u.avatarUrl || null,
     online: liveSockets.has(u.phone)
+  };
+}
+
+function publicGroup(g) {
+  if (!g) return null;
+  return {
+    id: g.id,
+    isGroup: true,
+    name: g.name,
+    color: g.color || "#6C8CFF",
+    members: g.members,
+    createdBy: g.createdBy
   };
 }
 
@@ -51,34 +66,33 @@ function sendToPhone(phone, type, payload) {
 }
 
 function broadcastPresence(phone, online) {
-  // Сообщаем о смене статуса всем, кто состоит в чате с этим человеком.
   const partners = new Set();
   Object.keys(state.chats).forEach((chatId) => {
+    if (chatId.startsWith("group:")) return;
     const [a, b] = chatId.split("|");
     if (a === phone) partners.add(b);
     if (b === phone) partners.add(a);
   });
+  Object.values(state.groups).forEach((g) => {
+    if (g.members.includes(phone)) {
+      g.members.forEach((m) => { if (m !== phone) partners.add(m); });
+    }
+  });
   partners.forEach((p) => sendToPhone(p, "presence", { phone, online }));
 }
 
-// ===================== HTTP API =====================
-
-// Шаг 1 регистрации: запросить код. В демо-режиме код фиксированный,
-// чтобы не подключать платный SMS-провайдер (Twilio и т.п.) — это
-// единственное место, которое нужно заменить для реальных SMS.
 app.post("/api/auth/request-code", (req, res) => {
   const { phone } = req.body;
   if (!phone || !/^\+\d{10,15}$/.test(phone)) {
     return res.status(400).json({ error: "Некорректный номер телефона" });
   }
-  const code = "1234"; // ЗАМЕНИТЬ на реальную интеграцию с SMS-провайдером
+  const code = "1234";
   state.verifyCodes[phone] = { code, expiresAt: Date.now() + 5 * 60 * 1000 };
   save();
   console.log(`[DEV] Код для ${phone}: ${code} (в реальном продукте уходит по SMS)`);
   res.json({ ok: true, devCode: code });
 });
 
-// Шаг 2: подтвердить код и зарегистрироваться / войти.
 app.post("/api/auth/verify-code", (req, res) => {
   const { phone, code, name, color } = req.body;
   const entry = state.verifyCodes[phone];
@@ -131,7 +145,6 @@ app.put("/api/me", authMiddleware, (req, res) => {
   res.json({ user: publicUser(req.user) });
 });
 
-// Смена номера телефона: тоже через код подтверждения нового номера.
 app.post("/api/me/change-phone", authMiddleware, (req, res) => {
   const { newPhone, code } = req.body;
   const entry = state.verifyCodes[newPhone];
@@ -148,7 +161,6 @@ app.post("/api/me/change-phone", authMiddleware, (req, res) => {
   delete state.users[oldPhone];
   state.users[newPhone] = user;
 
-  // Переносим чаты и избранное на новый номер.
   Object.keys(state.chats).forEach((chatId) => {
     if (chatId.includes(oldPhone)) {
       const newChatId = chatId.replace(oldPhone, newPhone);
@@ -179,10 +191,84 @@ app.get("/api/users/search", authMiddleware, (req, res) => {
   res.json({ user: publicUser(found) });
 });
 
+app.post("/api/groups", authMiddleware, (req, res) => {
+  const { name, memberPhones } = req.body;
+  if (!name || !name.trim()) {
+    return res.status(400).json({ error: "Укажите название группы" });
+  }
+  const validMembers = (memberPhones || []).filter((p) => state.users[p]);
+  const members = Array.from(new Set([req.user.phone, ...validMembers]));
+  if (members.length < 2) {
+    return res.status(400).json({ error: "Добавьте хотя бы одного участника" });
+  }
+  const id = nanoid(12);
+  const group = {
+    id,
+    name: name.trim(),
+    color: req.body.color || "#6C8CFF",
+    members,
+    createdBy: req.user.phone,
+    createdAt: Date.now()
+  };
+  state.groups[id] = group;
+  state.chats[groupChatId(id)] = { messages: [] };
+  save();
+
+  members.forEach((m) => {
+    if (m !== req.user.phone) sendToPhone(m, "group:added", { group: publicGroup(group) });
+  });
+
+  res.json({ group: publicGroup(group) });
+});
+
+app.get("/api/groups/:id", authMiddleware, (req, res) => {
+  const group = state.groups[req.params.id];
+  if (!group || !group.members.includes(req.user.phone)) {
+    return res.status(404).json({ error: "Группа не найдена" });
+  }
+  res.json({
+    group: publicGroup(group),
+    members: group.members.map((p) => publicUser(state.users[p])).filter(Boolean)
+  });
+});
+
+app.post("/api/groups/:id/members", authMiddleware, (req, res) => {
+  const group = state.groups[req.params.id];
+  if (!group || !group.members.includes(req.user.phone)) {
+    return res.status(404).json({ error: "Группа не найдена" });
+  }
+  const { phone } = req.body;
+  if (!state.users[phone]) {
+    return res.status(400).json({ error: "Пользователь с таким номером не найден" });
+  }
+  if (!group.members.includes(phone)) {
+    group.members.push(phone);
+    save();
+    sendToPhone(phone, "group:added", { group: publicGroup(group) });
+    group.members.forEach((m) => {
+      if (m !== req.user.phone) {
+        sendToPhone(m, "group:member-joined", { groupId: group.id, phone });
+      }
+    });
+  }
+  res.json({ group: publicGroup(group) });
+});
+
 app.get("/api/chats", authMiddleware, (req, res) => {
   const me = req.user.phone;
   const result = [];
   Object.keys(state.chats).forEach((chatId) => {
+    if (chatId.startsWith("group:")) {
+      const groupId = chatId.slice("group:".length);
+      const group = state.groups[groupId];
+      if (!group || !group.members.includes(me)) return;
+      const messages = state.chats[chatId].messages;
+      result.push({
+        contact: publicGroup(group),
+        lastMessage: messages[messages.length - 1] || null
+      });
+      return;
+    }
     const [a, b] = chatId.split("|");
     if (a !== me && b !== me) return;
     const otherPhone = a === me ? b : a;
@@ -197,18 +283,26 @@ app.get("/api/chats", authMiddleware, (req, res) => {
   res.json({ chats: result });
 });
 
-app.get("/api/chats/:phone/messages", authMiddleware, (req, res) => {
+app.get("/api/chats/:id/messages", authMiddleware, (req, res) => {
   const me = req.user.phone;
-  const other = req.params.phone;
-  const chatId = chatIdFor(me, other);
+  const targetId = req.params.id;
+  let chatId;
+  if (targetId.startsWith("group:")) {
+    const groupId = targetId.slice("group:".length);
+    const group = state.groups[groupId];
+    if (!group || !group.members.includes(me)) {
+      return res.status(404).json({ error: "Группа не найдена" });
+    }
+    chatId = groupChatId(groupId);
+  } else {
+    chatId = chatIdFor(me, targetId);
+  }
   const chat = state.chats[chatId];
   res.json({ messages: chat ? chat.messages : [] });
 });
 
-// Загрузка фото/аудио: принимаем base64 в JSON, сохраняем как файл на диск
-// и возвращаем URL — так сообщения в базе остаются маленькими.
 app.post("/api/upload", authMiddleware, (req, res) => {
-  const { dataUrl, kind } = req.body; // kind: "image" | "audio"
+  const { dataUrl, kind } = req.body;
   if (!dataUrl || !dataUrl.startsWith("data:")) {
     return res.status(400).json({ error: "Ожидался data URL" });
   }
@@ -254,7 +348,36 @@ app.delete("/api/favorites/:id", authMiddleware, (req, res) => {
 
 app.get("/health", (req, res) => res.json({ ok: true, usersOnline: liveSockets.size }));
 
-// ===================== WEBSOCKET: чат + сигналинг звонков =====================
+app.get("/api/stickers", authMiddleware, (req, res) => {
+  res.json({ stickers: state.stickers[req.user.phone] || [] });
+});
+
+app.post("/api/stickers", authMiddleware, (req, res) => {
+  const { dataUrl } = req.body;
+  if (!dataUrl || !dataUrl.startsWith("data:image/")) {
+    return res.status(400).json({ error: "Ожидалось изображение" });
+  }
+  const match = dataUrl.match(/^data:image\/([^;]+);base64,(.+)$/);
+  if (!match) return res.status(400).json({ error: "Некорректный формат изображения" });
+  const ext = match[1] === "jpeg" ? "jpg" : match[1];
+  const filename = `sticker_${nanoid(16)}.${ext}`;
+  fs.writeFileSync(path.join(UPLOADS_DIR, filename), Buffer.from(match[2], "base64"));
+
+  if (!state.stickers[req.user.phone]) state.stickers[req.user.phone] = [];
+  const sticker = { id: nanoid(10), url: `/uploads/${filename}`, createdAt: Date.now() };
+  state.stickers[req.user.phone].unshift(sticker);
+  save();
+  res.json({ sticker });
+});
+
+app.delete("/api/stickers/:id", authMiddleware, (req, res) => {
+  const list = state.stickers[req.user.phone];
+  if (list) {
+    state.stickers[req.user.phone] = list.filter((s) => s.id !== req.params.id);
+    save();
+  }
+  res.json({ ok: true });
+});
 
 wss.on("connection", (ws, req) => {
   const url = new URL(req.url, "http://localhost");
@@ -277,9 +400,33 @@ wss.on("connection", (ws, req) => {
     try { msg = JSON.parse(raw); } catch (e) { return; }
     const { type, payload } = msg;
 
-    // ---- обычные сообщения чата ----
     if (type === "chat:send") {
-      const { toPhone, message } = payload;
+      const { toPhone, toGroup, message } = payload;
+
+      if (toGroup) {
+        const group = state.groups[toGroup];
+        if (!group || !group.members.includes(phone)) return;
+        const chatId = groupChatId(toGroup);
+        if (!state.chats[chatId]) state.chats[chatId] = { messages: [] };
+        const fullMessage = {
+          id: nanoid(12),
+          from: phone,
+          type: message.type,
+          text: message.text || null,
+          mediaUrl: message.mediaUrl || null,
+          duration: message.duration || null,
+          time: new Date().toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" }),
+          ts: Date.now()
+        };
+        state.chats[chatId].messages.push(fullMessage);
+        save();
+        send(ws, "chat:ack", { tempId: message.tempId, message: fullMessage });
+        group.members.forEach((m) => {
+          if (m !== phone) sendToPhone(m, "chat:new", { fromGroup: toGroup, fromPhone: phone, message: fullMessage });
+        });
+        return;
+      }
+
       const chatId = chatIdFor(phone, toPhone);
       if (!state.chats[chatId]) state.chats[chatId] = { messages: [] };
       const fullMessage = {
@@ -299,10 +446,6 @@ wss.on("connection", (ws, req) => {
       return;
     }
 
-    // ---- сигналинг WebRTC для аудиозвонков ----
-    // Эти сообщения сервер просто переадресует от звонящего к принимающему
-    // и обратно — сам сервер аудио не обрабатывает, оно идёт между
-    // браузерами напрямую (peer-to-peer) после обмена этими "записками".
     if (type === "call:invite") {
       const { toPhone } = payload;
       const callee = state.users[toPhone];
@@ -335,12 +478,10 @@ wss.on("connection", (ws, req) => {
       return;
     }
     if (type === "call:sdp") {
-      // offer/answer SDP — пересылаем как есть
       sendToPhone(payload.toPhone, "call:sdp", { fromPhone: phone, sdp: payload.sdp, callId: payload.callId });
       return;
     }
     if (type === "call:ice") {
-      // ICE-кандидаты для установления p2p-соединения
       sendToPhone(payload.toPhone, "call:ice", { fromPhone: phone, candidate: payload.candidate, callId: payload.callId });
       return;
     }
@@ -353,8 +494,10 @@ wss.on("connection", (ws, req) => {
   });
 });
 
-server.listen(PORT, () => {
-  console.log(`Сервер «Связь» запущен: http://localhost:${PORT}`);
-  console.log(`Откройте этот адрес в браузере на разных устройствах в одной сети,`);
-  console.log(`или разверните на хостинге, чтобы дать ссылку друзьям.`);
+ready().then(() => {
+  server.listen(PORT, () => {
+    console.log(`Сервер «Связь» запущен: http://localhost:${PORT}`);
+    console.log(`Откройте этот адрес в браузере на разных устройствах в одной сети,`);
+    console.log(`или разверните на хостинге, чтобы дать ссылку друзьям.`);
+  });
 });

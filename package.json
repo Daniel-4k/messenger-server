@@ -11,7 +11,8 @@
   "dependencies": {
     "express": "^4.19.2",
     "ws": "^8.18.0",
-    "nanoid": "^3.3.7"
+    "nanoid": "^3.3.7",
+    "pg": "^8.12.0"
   },
   "engines": {
     "node": ">=18"

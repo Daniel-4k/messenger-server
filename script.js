@@ -14,9 +14,6 @@
   const SAVED_PHONE = "saved";
 
   /* ============ ЛОКАЛЬНАЯ СЕССИЯ (только токен авторизации) ============ */
-  // Само содержимое переписки больше не хранится в браузере — оно живёт на
-  // сервере. В браузере остаётся только токен, чтобы не вводить код заново
-  // при каждом открытии, плюс кэш текущего экрана для плавности интерфейса.
   const SESSION_KEY = "svyaz_session_v2";
   let session = { phone: null, token: null };
   function loadSession(){
@@ -33,16 +30,28 @@
     localStorage.removeItem(SESSION_KEY);
   }
 
-  /* ============ ЛОКАЛЬНЫЙ КЭШ ДЛЯ ОТРИСОВКИ ============ */
-  let me = null;              // публичные данные своего профиля
-  let chatsCache = [];         // [{contact, lastMessage}]
-  let messagesCache = {};      // phone -> [messages]
-  let contactsCache = {};      // phone -> contact info (для аватаров/имён)
-  let favoritesCache = [];     // личные заметки в "Избранном"
-  let pendingPhone = null;     // номер, ожидающий подтверждения кода (вход/регистрация)
-  let pendingNewPhone = null;  // номер при смене телефона в профиле
+  let me = null;
+  let chatsCache = [];
+  let messagesCache = {};
+  let contactsCache = {};
+  let groupsCache = {};
+  let favoritesCache = [];
+  let stickersCache = [];
+  let groupMemberSelection = [];
+  let pendingPhone = null;
+  let pendingNewPhone = null;
 
-  /* ============ СЕТЕВЫЕ ХЕЛПЕРЫ ============ */
+  const EMOJI_SET = [
+    "😀","😁","😂","🤣","😊","😍","🥰","😘","😎","🤩","🥳","😇",
+    "🙂","🙃","😉","😋","😜","🤪","😏","😒","😞","😢","😭","😡",
+    "🤔","🤨","😴","🥱","😱","😳","🤯","🥶","🤗","🤭","🤫","🫡",
+    "👍","👎","👏","🙌","🙏","💪","👋","🤝","✌️","🤞","👌","✋",
+    "❤️","🧡","💛","💚","💙","💜","🖤","🤍","💔","💯","🔥","✨",
+    "🎉","🎊","🎁","🎂","🌹","🌸","☀️","🌙","⭐","⚡","🌈","☕",
+    "🍕","🍔","🍎","🍓","🍿","🥳","🚀","🚗","✈️","🏠","📞","⏰",
+    "📷","🎵","🎮","⚽","🏆","💰","💡","🔑","🔒","✅","❌","❓"
+  ];
+
   async function api(method, urlPath, body){
     const headers = { "Content-Type": "application/json" };
     if(session.token){
@@ -97,6 +106,7 @@
     if(!msg) return "";
     if(msg.type==="image") return "📷 Фото";
     if(msg.type==="audio") return "🎤 Голосовое сообщение";
+    if(msg.type==="sticker") return "🙂 Стикер";
     return msg.text || "";
   }
   function formatClock(tsOrIso){
@@ -116,7 +126,6 @@
     t._timer = setTimeout(()=> t.classList.remove("show"), 2400);
   }
 
-  /* ============ НАВИГАЦИЯ МЕЖДУ ЭКРАНАМИ ============ */
   const screens = {};
   document.querySelectorAll(".screen").forEach(s=>{ screens[s.dataset.screen] = s; });
   let screenStack = ["welcome"];
@@ -136,10 +145,15 @@
     btn.addEventListener("click", ()=> goBack(btn.dataset.back));
   });
 
-  /* ============ АВАТАРКИ ============ */
   function avatarEl(contact, sizeClass, withOnlineDot){
     const div = document.createElement("div");
     div.className = "avatar " + (sizeClass||"");
+    if(contact && contact.isGroup){
+      div.classList.add("group-icon");
+      div.style.background = contact.color || "#6C8CFF";
+      div.innerHTML = `<svg viewBox="0 0 24 24" fill="none" width="55%" height="55%"><circle cx="9" cy="8" r="3" stroke="#fff" stroke-width="2"/><circle cx="17" cy="9" r="2.5" stroke="#fff" stroke-width="2"/><path d="M3 19c0-3 2.7-5 6-5s6 2 6 5M15 14.5c2.5.3 4 1.7 4 4.5" stroke="#fff" stroke-width="2" stroke-linecap="round"/></svg>`;
+      return div;
+    }
     if(contact && contact.avatarUrl){
       div.style.background = "var(--panel-2)";
       const img = document.createElement("img");
@@ -166,9 +180,6 @@
     return div;
   }
 
-  /* ============================================================
-     АВТОРИЗАЦИЯ: ввод номера → код подтверждения → (создание профиля)
-  ============================================================ */
   document.getElementById("goToPhone").addEventListener("click", ()=> showScreen("phone"));
 
   const phoneInput = document.getElementById("phoneInput");
@@ -230,13 +241,12 @@
   setupCodeEntry("codeHiddenInput","codeRow", async (code)=>{
     document.getElementById("codeError").classList.remove("show");
     try{
-      // Сперва пробуем войти без имени — если пользователь уже существует,
-      // сервер вернёт токен сразу. Если нет — попросит имя на экране setup.
       const data = await api("POST","/api/auth/verify-code", { phone: pendingPhone, code });
       session = { phone: pendingPhone, token: data.token };
       saveSession();
       me = data.user;
       await loadFavorites();
+      await loadStickers();
       await enterApp();
     }catch(e){
       if(e.status===400 && /имя/i.test(e.message)){
@@ -256,7 +266,6 @@
   });
   document.getElementById("changeNumberBtn").addEventListener("click", ()=> goBack("phone"));
 
-  /* ============ НАСТРОЙКА ПРОФИЛЯ ПРИ РЕГИСТРАЦИИ ============ */
   let setupColor = AVATAR_COLORS[0];
   let setupAvatarDataUrl = null;
   const setupSwatchesEl = document.getElementById("setupSwatches");
@@ -339,14 +348,8 @@
     const btn = document.getElementById("finishSetupBtn");
     btn.disabled = true;
     try{
-      // Код уже был "использован" в попытке выше и протух на сервере как
-      // одноразовый — поэтому запрашиваем новый перед финальной регистрацией.
       const reissue = await api("POST","/api/auth/request-code", { phone: pendingPhone });
       const code = reissue.devCode || "1234";
-      let avatarUrl = null;
-      if(setupAvatarDataUrl){
-        // Грузим фото уже после получения токена ниже; пока просто помним data URL.
-      }
       const data = await api("POST","/api/auth/verify-code", {
         phone: pendingPhone, code, name, color: setupColor
       });
@@ -359,6 +362,7 @@
         me = updated.user;
       }
       await loadFavorites();
+      await loadStickers();
       toast("Аккаунт создан");
       await enterApp();
     }catch(e){
@@ -367,9 +371,6 @@
     }
   });
 
-  /* ============================================================
-     WEBSOCKET: реалтайм-сообщения + presence + сигналинг звонков
-  ============================================================ */
   let ws = null;
   let wsReconnectTimer = null;
 
@@ -380,7 +381,7 @@
     ws.onopen = ()=>{ console.log("WS подключён"); };
     ws.onclose = ()=>{
       clearTimeout(wsReconnectTimer);
-      wsReconnectTimer = setTimeout(connectWebSocket, 2000); // авто-переподключение
+      wsReconnectTimer = setTimeout(connectWebSocket, 2000);
     };
     ws.onerror = ()=>{};
     ws.onmessage = (event)=>{
@@ -398,22 +399,44 @@
 
   function handleWsMessage(type, payload){
     if(type==="chat:new"){
+      if(payload.fromGroup){
+        const key = "group:"+payload.fromGroup;
+        if(!messagesCache[key]) messagesCache[key] = [];
+        messagesCache[key].push(payload.message);
+        if(currentThreadGroupId===payload.fromGroup){ renderMessages(); }
+        else {
+          const g = groupsCache[payload.fromGroup];
+          toast(`Новое сообщение в группе «${g ? g.name : "группа"}»`);
+        }
+        refreshChatList();
+        return;
+      }
       const phone = payload.fromPhone;
       if(!messagesCache[phone]) messagesCache[phone] = [];
       messagesCache[phone].push(payload.message);
-      if(currentThreadPhone===phone){ renderMessages(); }
+      if(currentThreadPhone===phone && !currentThreadGroupId){ renderMessages(); }
       else { toast(`Новое сообщение от ${contactsCache[phone] ? contactsCache[phone].name : phone}`); }
       refreshChatList();
       return;
     }
     if(type==="chat:ack"){
-      // подтверждение собственного отправленного сообщения (на случай нескольких вкладок)
       return;
     }
     if(type==="presence"){
       if(contactsCache[payload.phone]) contactsCache[payload.phone].online = payload.online;
       if(currentThreadPhone===payload.phone) updateThreadStatusLine(contactsCache[payload.phone]);
       refreshChatList();
+      return;
+    }
+    if(type==="group:added"){
+      groupsCache[payload.group.id] = payload.group;
+      toast(`Вас добавили в группу «${payload.group.name}»`);
+      refreshChatList();
+      return;
+    }
+    if(type==="group:member-joined"){
+      const g = groupsCache[payload.groupId];
+      if(g && !g.members.includes(payload.phone)) g.members.push(payload.phone);
       return;
     }
     if(type==="call:incoming"){ handleIncomingCall(payload); return; }
@@ -426,9 +449,6 @@
     if(type==="call:unavailable"){ handleCallUnavailable(payload); return; }
   }
 
-  /* ============================================================
-     ВХОД В ПРИЛОЖЕНИЕ / ЗАГРУЗКА ДАННЫХ
-  ============================================================ */
   async function enterApp(){
     screenStack = ["home"];
     Object.values(screens).forEach(s=>s.classList.add("hidden"));
@@ -454,7 +474,6 @@
     const wrap = document.getElementById("chatListScroll");
     wrap.innerHTML = "";
 
-    // "Избранное" закреплено первым всегда.
     const savedLast = favoritesCache[favoritesCache.length-1];
     const savedRow = document.createElement("div");
     savedRow.className = "chat-row pinned";
@@ -493,7 +512,7 @@
     sorted.forEach(({contact, lastMessage})=>{
       const row = document.createElement("div");
       row.className = "chat-row";
-      row.appendChild(avatarEl(contact, "", contact.online));
+      row.appendChild(avatarEl(contact, "", contact.isGroup ? undefined : contact.online));
       const meta = document.createElement("div");
       meta.className = "chat-meta";
       meta.innerHTML = `
@@ -501,15 +520,24 @@
           <div class="chat-name">${escapeHtml(contact.name)}</div>
           <div class="chat-time">${lastMessage ? formatClock(lastMessage.ts) : ""}</div>
         </div>
-        <div class="chat-preview">${lastMessage ? ((lastMessage.from===me.phone ? "Вы: " : "")+escapeHtml(previewTextFor(lastMessage))) : "Нет сообщений"}</div>
+        <div class="chat-preview">${lastMessage ? ((lastMessage.from===me.phone ? "Вы: " : (contact.isGroup ? escapeHtml(nameForSender(lastMessage.from))+": " : ""))+escapeHtml(previewTextFor(lastMessage))) : "Нет сообщений"}</div>
       `;
       row.appendChild(meta);
-      row.addEventListener("click", ()=> openThread(contact.phone));
+      if(contact.isGroup){
+        groupsCache[contact.id] = contact;
+        row.addEventListener("click", ()=> openGroupThread(contact.id));
+      } else {
+        row.addEventListener("click", ()=> openThread(contact.phone));
+      }
       wrap.appendChild(row);
     });
   }
 
-  /* ============ НИЖНЯЯ НАВИГАЦИЯ ============ */
+  function nameForSender(phone){
+    if(phone===me.phone) return "Вы";
+    return (contactsCache[phone] && contactsCache[phone].name) || "Участник";
+  }
+
   document.querySelectorAll("[data-nav]").forEach(btn=>{
     btn.addEventListener("click", ()=>{
       const target = btn.dataset.nav;
@@ -529,7 +557,6 @@
     document.getElementById("searchPhoneInput").focus();
   });
 
-  /* ============ ПОИСК ПО НОМЕРУ ============ */
   const searchInput = document.getElementById("searchPhoneInput");
   function renderSearchEmpty(){
     document.getElementById("searchResultArea").innerHTML = `<div class="empty-state">
@@ -591,17 +618,15 @@
       toast(e.message || "Ошибка поиска");
     }
   }
-
-  /* ============================================================
-     ЧАТ: загрузка истории, отправка текста/фото/аудио
-  ============================================================ */
   let currentThreadPhone = null;
   let currentThreadIsSaved = false;
+  let currentThreadGroupId = null;
   let pendingImageDataUrl = null;
 
   async function openThread(phone){
     currentThreadPhone = phone;
     currentThreadIsSaved = false;
+    currentThreadGroupId = null;
     const contact = contactsCache[phone];
 
     const threadAvatarWrap = document.getElementById("threadAvatar");
@@ -616,6 +641,7 @@
     document.getElementById("msgInput").value="";
     cancelImagePreview();
     closeAttachMenu();
+    closeComposerPanel();
     updateSendBtn();
 
     document.getElementById("messagesArea").innerHTML = `<div class="empty-state" style="flex:1;"><div class="e-icon">⏳</div><div class="e-title">Загрузка переписки…</div></div>`;
@@ -628,9 +654,45 @@
     }
   }
 
+  async function openGroupThread(groupId){
+    currentThreadPhone = null;
+    currentThreadIsSaved = false;
+    currentThreadGroupId = groupId;
+    const group = groupsCache[groupId];
+    if(!group) return;
+
+    const threadAvatarWrap = document.getElementById("threadAvatar");
+    threadAvatarWrap.innerHTML = "";
+    threadAvatarWrap.appendChild(avatarEl(group, "sm"));
+    document.getElementById("threadName").textContent = group.name;
+    const statusEl = document.getElementById("threadStatus");
+    statusEl.textContent = `${group.members.length} участник${group.members.length===1?"":(group.members.length<5?"а":"ов")}`;
+    statusEl.classList.remove("online");
+    document.getElementById("threadFavBtn").classList.add("vis-hidden");
+    document.getElementById("threadCallBtn").classList.add("vis-hidden");
+
+    showScreen("thread");
+    document.getElementById("msgInput").value="";
+    cancelImagePreview();
+    closeAttachMenu();
+    closeComposerPanel();
+    updateSendBtn();
+
+    const key = "group:"+groupId;
+    document.getElementById("messagesArea").innerHTML = `<div class="empty-state" style="flex:1;"><div class="e-icon">⏳</div><div class="e-title">Загрузка переписки…</div></div>`;
+    try{
+      const data = await api("GET", `/api/chats/${encodeURIComponent(key)}/messages`);
+      messagesCache[key] = data.messages;
+      renderMessages();
+    }catch(e){
+      toast(e.message || "Не удалось загрузить сообщения");
+    }
+  }
+
   function openSavedThread(){
     currentThreadPhone = SAVED_PHONE;
     currentThreadIsSaved = true;
+    currentThreadGroupId = null;
     const threadAvatarWrap = document.getElementById("threadAvatar");
     threadAvatarWrap.innerHTML = "";
     const icon = savedIconEl();
@@ -678,6 +740,9 @@
     if(m.type==="image"){
       return `<img class="bubble-image" src="${m.mediaUrl}" alt="Изображение"><div class="b-time">${time}</div>`;
     }
+    if(m.type==="sticker"){
+      return `<img class="sticker-image" src="${m.mediaUrl}" alt="Стикер">`;
+    }
     if(m.type==="audio"){
       const dur = m.duration||0;
       const mins = Math.floor(dur/60), secs = (dur%60).toString().padStart(2,"0");
@@ -695,7 +760,9 @@
   function renderMessages(){
     const area = document.getElementById("messagesArea");
     area.innerHTML = "";
-    const list = currentThreadIsSaved ? favoritesCache : (messagesCache[currentThreadPhone] || []);
+    const list = currentThreadIsSaved
+      ? favoritesCache
+      : (currentThreadGroupId ? (messagesCache["group:"+currentThreadGroupId] || []) : (messagesCache[currentThreadPhone] || []));
 
     if(list.length===0){
       area.innerHTML = currentThreadIsSaved
@@ -706,8 +773,8 @@
           </div>`
         : `<div class="empty-state" style="flex:1;">
             <div class="e-icon">👋</div>
-            <div class="e-title">Начните переписку</div>
-            <div class="e-sub">Отправьте текст, фото или голосовое сообщение.</div>
+            <div class="e-title">${currentThreadGroupId ? "Начните общение в группе" : "Начните переписку"}</div>
+            <div class="e-sub">Отправьте текст, фото, стикер или голосовое сообщение.</div>
           </div>`;
       return;
     }
@@ -716,24 +783,45 @@
       const isMine = currentThreadIsSaved ? true : (m.from===me.phone);
       const row = document.createElement("div");
       row.className = "msg-row" + (isMine ? " mine":"");
-      const bubble = document.createElement("div");
-      bubble.className = "bubble " + (isMine ? "mine":"theirs") + (m.type==="image" ? " has-image":"");
-      bubble.innerHTML = buildBubbleInner(m);
 
-      if(!currentThreadIsSaved){
-        attachLongPress(bubble, ()=> openMsgContext(m));
+      if(currentThreadGroupId && !isMine){
+        const label = document.createElement("div");
+        label.className = "msg-sender-label";
+        label.textContent = nameForSender(m.from);
+        label.style.color = (contactsCache[m.from] && contactsCache[m.from].color) || "var(--accent)";
+        const col = document.createElement("div");
+        col.style.display = "flex";
+        col.style.flexDirection = "column";
+        col.style.maxWidth = "75%";
+        col.appendChild(label);
+        const bubble = buildBubbleEl(m, isMine);
+        col.appendChild(bubble);
+        row.appendChild(col);
+      } else {
+        const bubble = buildBubbleEl(m, isMine);
+        row.appendChild(bubble);
       }
-      if(m.type==="audio"){
-        bubble.querySelector("[data-audio-toggle]").addEventListener("click",(e)=>{
-          e.stopPropagation();
-          toggleAudioPlayback(m);
-        });
-        renderWaveBars(bubble.querySelector(".audio-wave-track"), 22);
-      }
-      row.appendChild(bubble);
       area.appendChild(row);
     });
     area.scrollTop = area.scrollHeight;
+  }
+
+  function buildBubbleEl(m, isMine){
+    const bubble = document.createElement("div");
+    bubble.className = "bubble " + (isMine ? "mine":"theirs") +
+      (m.type==="image" ? " has-image":"") + (m.type==="sticker" ? " has-sticker":"");
+    bubble.innerHTML = buildBubbleInner(m);
+    if(!currentThreadIsSaved){
+      attachLongPress(bubble, ()=> openMsgContext(m));
+    }
+    if(m.type==="audio"){
+      bubble.querySelector("[data-audio-toggle]").addEventListener("click",(e)=>{
+        e.stopPropagation();
+        toggleAudioPlayback(m);
+      });
+      renderWaveBars(bubble.querySelector(".audio-wave-track"), 22);
+    }
+    return bubble;
   }
 
   function attachLongPress(el, callback){
@@ -769,7 +857,6 @@
     audio.play().catch(()=>{ toast("Не удалось воспроизвести запись"); activeAudioMsgId=null; });
   }
 
-  /* ---- контекстное меню сообщения: избранное / копировать / удалить ---- */
   let contextMsgRef = null;
   function openMsgContext(m){
     contextMsgRef = m;
@@ -815,13 +902,10 @@
     closeMsgContext();
   });
   document.getElementById("ctxDeleteBtn").addEventListener("click", ()=>{
-    // Удаление чужих сообщений с сервера не поддерживается намеренно —
-    // только локальная пометка/просмотр; здесь убираем только из своего вида.
     toast("Удаление сообщений на сервере недоступно в этой демо-версии");
     closeMsgContext();
   });
 
-  /* ---- ввод текста и отправка ---- */
   const msgInput = document.getElementById("msgInput");
   msgInput.addEventListener("input", ()=>{
     msgInput.style.height="auto";
@@ -870,10 +954,15 @@
     }
     const tempId = "tmp"+Date.now()+Math.random();
     const optimistic = Object.assign({ id: tempId, from: me.phone, ts: Date.now() }, messagePart);
-    if(!messagesCache[currentThreadPhone]) messagesCache[currentThreadPhone] = [];
-    messagesCache[currentThreadPhone].push(optimistic);
+    const cacheKey = currentThreadGroupId ? "group:"+currentThreadGroupId : currentThreadPhone;
+    if(!messagesCache[cacheKey]) messagesCache[cacheKey] = [];
+    messagesCache[cacheKey].push(optimistic);
     renderMessages();
-    wsSend("chat:send", { toPhone: currentThreadPhone, message: Object.assign({ tempId }, messagePart) });
+    if(currentThreadGroupId){
+      wsSend("chat:send", { toGroup: currentThreadGroupId, message: Object.assign({ tempId }, messagePart) });
+    } else {
+      wsSend("chat:send", { toPhone: currentThreadPhone, message: Object.assign({ tempId }, messagePart) });
+    }
     renderChatListSoon();
   }
 
@@ -886,13 +975,13 @@
   document.getElementById("threadNameBlock").addEventListener("click", ()=>{
     if(!currentThreadIsSaved) toast(`${contactsCache[currentThreadPhone].name} · ${currentThreadPhone}`);
   });
-  document.getElementById("threadFavBtn").addEventListener("click", ()=>{}); // зарезервировано
+  document.getElementById("threadFavBtn").addEventListener("click", ()=>{});
 
-  /* ---- меню вложений (фото / аудио) ---- */
   const attachMenu = document.getElementById("attachMenu");
   function closeAttachMenu(){ attachMenu.classList.remove("open"); }
   document.getElementById("attachToggleBtn").addEventListener("click", (e)=>{
     e.stopPropagation();
+    closeComposerPanel();
     attachMenu.classList.toggle("open");
   });
   document.addEventListener("click", (e)=>{
@@ -924,7 +1013,6 @@
   }
   document.getElementById("cancelImagePreview").addEventListener("click", cancelImagePreview);
 
-  /* ---- запись голосовых сообщений ---- */
   let mediaRecorder = null, recordedChunks = [], recordingStartTs = 0, recordingTimerInterval = null;
   let isRecording = false, recordingCancelled = false;
 
@@ -997,19 +1085,349 @@
   }
   document.querySelector(".rec-cancel-label").addEventListener("click", ()=>{ if(isRecording) stopRecording(true); });
 
-  /* ============================================================
-     ИЗБРАННОЕ (личные заметки себе — отдельный чат)
-  ============================================================ */
+  const composerPanel = document.getElementById("composerPanel");
+  function closeComposerPanel(){ composerPanel.classList.remove("open"); }
+  function toggleComposerPanel(){
+    closeAttachMenu();
+    composerPanel.classList.toggle("open");
+    if(composerPanel.classList.contains("open")) renderStickerGrid();
+  }
+  document.getElementById("emojiToggleBtn").addEventListener("click", (e)=>{
+    e.stopPropagation();
+    toggleComposerPanel();
+  });
+  document.addEventListener("click", (e)=>{
+    if(!composerPanel.contains(e.target) && e.target.id!=="emojiToggleBtn"){
+      closeComposerPanel();
+    }
+  });
+
+  const emojiGrid = document.getElementById("emojiGrid");
+  EMOJI_SET.forEach(em=>{
+    const btn = document.createElement("button");
+    btn.className = "emoji-cell";
+    btn.textContent = em;
+    btn.addEventListener("click", ()=>{
+      msgInput.value += em;
+      msgInput.dispatchEvent(new Event("input"));
+      msgInput.focus();
+    });
+    emojiGrid.appendChild(btn);
+  });
+
+  document.getElementById("emojiTabBtn").addEventListener("click", ()=> switchComposerTab("emoji"));
+  document.getElementById("stickerTabBtn").addEventListener("click", ()=> switchComposerTab("sticker"));
+  function switchComposerTab(tab){
+    document.getElementById("emojiTabBtn").classList.toggle("active", tab==="emoji");
+    document.getElementById("stickerTabBtn").classList.toggle("active", tab==="sticker");
+    document.getElementById("emojiPanelBody").classList.toggle("vis-hidden", tab!=="emoji");
+    document.getElementById("stickerPanelBody").classList.toggle("vis-hidden", tab!=="sticker");
+    if(tab==="sticker") renderStickerGrid();
+  }
+
+  function renderStickerGrid(){
+    const grid = document.getElementById("stickerGrid");
+    grid.innerHTML = "";
+    const addCell = document.createElement("button");
+    addCell.className = "sticker-add-cell";
+    addCell.textContent = "+";
+    addCell.title = "Создать стикер из фото";
+    addCell.addEventListener("click", ()=> document.getElementById("stickerFileInput").click());
+    grid.appendChild(addCell);
+
+    if(stickersCache.length===0){
+      const hint = document.createElement("div");
+      hint.className = "sticker-empty-hint";
+      hint.style.gridColumn = "span 3";
+      hint.textContent = "Нажмите «+», чтобы сделать свой первый стикер из фото";
+      grid.appendChild(hint);
+      return;
+    }
+    stickersCache.forEach(s=>{
+      const cell = document.createElement("button");
+      cell.className = "sticker-cell";
+      cell.innerHTML = `<img src="${s.url}" alt="Стикер">`;
+      cell.addEventListener("click", ()=>{
+        closeComposerPanel();
+        dispatchOutgoing({ type:"sticker", mediaUrl: s.url });
+      });
+      attachLongPress(cell, ()=>{
+        if(confirm("Удалить этот стикер из вашего набора?")) deleteSticker(s.id);
+      });
+      grid.appendChild(cell);
+    });
+  }
+
+  async function loadStickers(){
+    try{
+      const data = await api("GET","/api/stickers");
+      stickersCache = data.stickers;
+    }catch(e){ }
+  }
+  async function deleteSticker(id){
+    try{
+      await api("DELETE", "/api/stickers/"+encodeURIComponent(id));
+      stickersCache = stickersCache.filter(s=>s.id!==id);
+      renderStickerGrid();
+      toast("Стикер удалён");
+    }catch(e){ toast(e.message); }
+  }
+
+  let stickerSourceImg = null;
+  let stickerZoom = 1;
+  let stickerOffsetX = 0, stickerOffsetY = 0;
+  let stickerDragState = null;
+
+  document.getElementById("stickerFileInput").addEventListener("change", (e)=>{
+    const file = e.target.files[0];
+    if(!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev)=>{
+      const img = new Image();
+      img.onload = ()=>{
+        stickerSourceImg = img;
+        stickerZoom = 1; stickerOffsetX = 0; stickerOffsetY = 0;
+        document.getElementById("stickerZoomRange").value = 100;
+        const previewImg = document.getElementById("stickerMakerImg");
+        previewImg.src = ev.target.result;
+        layoutStickerMakerImage();
+        document.getElementById("stickerMakerOverlay").classList.add("show");
+      };
+      img.src = ev.target.result;
+    };
+    reader.readAsDataURL(file);
+    e.target.value = "";
+  });
+
+  function layoutStickerMakerImage(){
+    const stage = document.getElementById("stickerMakerStage");
+    const img = document.getElementById("stickerMakerImg");
+    const stageSize = stage.clientWidth || 300;
+    const natW = stickerSourceImg.width, natH = stickerSourceImg.height;
+    const baseScale = Math.max(stageSize/natW, stageSize/natH);
+    const scale = baseScale * stickerZoom;
+    img.style.width = (natW*scale)+"px";
+    img.style.height = (natH*scale)+"px";
+    img.style.left = ((stageSize - natW*scale)/2 + stickerOffsetX)+"px";
+    img.style.top = ((stageSize - natH*scale)/2 + stickerOffsetY)+"px";
+  }
+
+  document.getElementById("stickerZoomRange").addEventListener("input", (e)=>{
+    stickerZoom = e.target.value/100;
+    layoutStickerMakerImage();
+  });
+
+  (function setupStickerDrag(){
+    const stage = document.getElementById("stickerMakerStage");
+    const start = (x,y)=>{ stickerDragState = { x, y, ox:stickerOffsetX, oy:stickerOffsetY }; };
+    const move = (x,y)=>{
+      if(!stickerDragState) return;
+      stickerOffsetX = stickerDragState.ox + (x-stickerDragState.x);
+      stickerOffsetY = stickerDragState.oy + (y-stickerDragState.y);
+      layoutStickerMakerImage();
+    };
+    const end = ()=>{ stickerDragState = null; };
+    stage.addEventListener("mousedown", (e)=> start(e.clientX,e.clientY));
+    window.addEventListener("mousemove", (e)=> move(e.clientX,e.clientY));
+    window.addEventListener("mouseup", end);
+    stage.addEventListener("touchstart", (e)=>{ const t=e.touches[0]; start(t.clientX,t.clientY); }, {passive:true});
+    stage.addEventListener("touchmove", (e)=>{ const t=e.touches[0]; move(t.clientX,t.clientY); }, {passive:true});
+    stage.addEventListener("touchend", end);
+  })();
+
+  document.getElementById("cancelStickerMakerBtn").addEventListener("click", ()=>{
+    document.getElementById("stickerMakerOverlay").classList.remove("show");
+    stickerSourceImg = null;
+  });
+
+  document.getElementById("saveStickerBtn").addEventListener("click", async ()=>{
+    if(!stickerSourceImg) return;
+    const OUT = 360;
+    const stage = document.getElementById("stickerMakerStage");
+    const stageSize = stage.clientWidth || 300;
+    const natW = stickerSourceImg.width, natH = stickerSourceImg.height;
+    const baseScale = Math.max(stageSize/natW, stageSize/natH);
+    const scale = baseScale * stickerZoom;
+    const drawW = natW*scale, drawH = natH*scale;
+    const drawLeft = (stageSize - drawW)/2 + stickerOffsetX;
+    const drawTop = (stageSize - drawH)/2 + stickerOffsetY;
+
+    const canvas = document.createElement("canvas");
+    canvas.width = OUT; canvas.height = OUT;
+    const ctx = canvas.getContext("2d");
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(OUT/2, OUT/2, OUT/2, 0, Math.PI*2);
+    ctx.closePath();
+    ctx.clip();
+    const outScale = OUT/stageSize;
+    ctx.drawImage(stickerSourceImg, drawLeft*outScale, drawTop*outScale, drawW*outScale, drawH*outScale);
+    ctx.restore();
+
+    const dataUrl = canvas.toDataURL("image/png");
+    try{
+      const data = await api("POST","/api/stickers", { dataUrl });
+      stickersCache.unshift(data.sticker);
+      document.getElementById("stickerMakerOverlay").classList.remove("show");
+      stickerSourceImg = null;
+      toast("Стикер сохранён");
+      renderStickerGrid();
+      switchComposerTab("sticker");
+    }catch(e){ toast(e.message || "Не удалось сохранить стикер"); }
+  });
+
+  const newChatSheetOverlay = document.getElementById("newChatSheetOverlay");
+  document.getElementById("openNewChatBtn").addEventListener("click", ()=>{
+    newChatSheetOverlay.classList.add("show");
+  });
+  document.getElementById("newChatSheetCancel").addEventListener("click", ()=>{
+    newChatSheetOverlay.classList.remove("show");
+  });
+  newChatSheetOverlay.addEventListener("click", (e)=>{
+    if(e.target===newChatSheetOverlay) newChatSheetOverlay.classList.remove("show");
+  });
+  document.getElementById("newChatDmOption").addEventListener("click", ()=>{
+    newChatSheetOverlay.classList.remove("show");
+    showScreen("search");
+    document.getElementById("searchPhoneInput").focus();
+  });
+  document.getElementById("newChatGroupOption").addEventListener("click", ()=>{
+    newChatSheetOverlay.classList.remove("show");
+    openCreateGroupScreen();
+  });
+
+  function openCreateGroupScreen(){
+    groupMemberSelection = [];
+    document.getElementById("groupNameInput").value = "";
+    document.getElementById("groupMemberSearchInput").value = "";
+    document.getElementById("groupMemberSearchResult").innerHTML = "";
+    renderSelectedMembersRow();
+    renderGroupQuickPickList();
+    updateCreateGroupBtn();
+    showScreen("createGroup");
+  }
+
+  document.getElementById("groupNameInput").addEventListener("input", updateCreateGroupBtn);
+  function updateCreateGroupBtn(){
+    const name = document.getElementById("groupNameInput").value.trim();
+    document.getElementById("createGroupBtn").disabled = !(name.length>0 && groupMemberSelection.length>0);
+  }
+
+  function renderSelectedMembersRow(){
+    const row = document.getElementById("selectedMembersRow");
+    row.innerHTML = "";
+    groupMemberSelection.forEach(phone=>{
+      const contact = contactsCache[phone];
+      const chip = document.createElement("div");
+      chip.className = "selected-member-chip";
+      chip.innerHTML = `<span>${escapeHtml(contact ? contact.name : phone)}</span><span class="chip-x">✕</span>`;
+      chip.querySelector(".chip-x").addEventListener("click", ()=>{
+        groupMemberSelection = groupMemberSelection.filter(p=>p!==phone);
+        renderSelectedMembersRow();
+        renderGroupQuickPickList();
+        updateCreateGroupBtn();
+      });
+      row.appendChild(chip);
+    });
+  }
+
+  function renderGroupQuickPickList(){
+    const wrap = document.getElementById("groupQuickPickList");
+    wrap.innerHTML = "";
+    const knownPhones = chatsCache.map(c=>c.contact).filter(c=>!c.isGroup).map(c=>c.phone);
+    if(knownPhones.length===0){
+      wrap.innerHTML = `<div class="sticker-empty-hint">Пока нет ни одного контакта — найдите человека по номеру выше.</div>`;
+      return;
+    }
+    knownPhones.forEach(phone=>{
+      const contact = contactsCache[phone];
+      const row = document.createElement("div");
+      row.className = "member-pick-row" + (groupMemberSelection.includes(phone) ? " checked":"");
+      row.appendChild(avatarEl(contact, "sm"));
+      const text = document.createElement("div");
+      text.style.flex="1";
+      text.innerHTML = `<div style="font-weight:600;font-size:14.5px;">${escapeHtml(contact.name)}</div>`;
+      row.appendChild(text);
+      const check = document.createElement("div");
+      check.className = "mp-check";
+      check.textContent = groupMemberSelection.includes(phone) ? "✓" : "";
+      row.appendChild(check);
+      row.addEventListener("click", ()=> toggleGroupMember(phone));
+      wrap.appendChild(row);
+    });
+  }
+
+  function toggleGroupMember(phone){
+    if(groupMemberSelection.includes(phone)){
+      groupMemberSelection = groupMemberSelection.filter(p=>p!==phone);
+    } else {
+      groupMemberSelection.push(phone);
+    }
+    renderSelectedMembersRow();
+    renderGroupQuickPickList();
+    updateCreateGroupBtn();
+  }
+
+  const groupMemberSearchInput = document.getElementById("groupMemberSearchInput");
+  let groupSearchDebounce = null;
+  groupMemberSearchInput.addEventListener("input", ()=>{
+    const {digits} = fullPhoneFromInput(groupMemberSearchInput.value);
+    groupMemberSearchInput.value = "+7 " + formatRuPhone(digits);
+    if(groupMemberSearchInput.value.trim()==="+7") groupMemberSearchInput.value="";
+    clearTimeout(groupSearchDebounce);
+    groupSearchDebounce = setTimeout(doGroupMemberSearch, 250);
+  });
+  async function doGroupMemberSearch(){
+    const area = document.getElementById("groupMemberSearchResult");
+    const {full} = fullPhoneFromInput(groupMemberSearchInput.value);
+    if(!full){ area.innerHTML=""; return; }
+    if(full===me.phone){ area.innerHTML = `<div class="sticker-empty-hint">Это ваш номер</div>`; return; }
+    try{
+      const data = await api("GET", "/api/users/search?phone="+encodeURIComponent(full));
+      if(!data.user){ area.innerHTML = `<div class="sticker-empty-hint">Пользователь не найден</div>`; return; }
+      contactsCache[data.user.phone] = data.user;
+      area.innerHTML = "";
+      const row = document.createElement("div");
+      row.className = "member-pick-row" + (groupMemberSelection.includes(data.user.phone) ? " checked":"");
+      row.appendChild(avatarEl(data.user, "sm"));
+      const text = document.createElement("div");
+      text.style.flex="1";
+      text.innerHTML = `<div style="font-weight:600;font-size:14.5px;">${escapeHtml(data.user.name)}</div>`;
+      row.appendChild(text);
+      const check = document.createElement("div");
+      check.className = "mp-check";
+      check.textContent = groupMemberSelection.includes(data.user.phone) ? "✓" : "";
+      row.appendChild(check);
+      row.addEventListener("click", ()=>{ toggleGroupMember(data.user.phone); doGroupMemberSearch(); });
+      area.appendChild(row);
+    }catch(e){ toast(e.message); }
+  }
+
+  document.getElementById("createGroupBtn").addEventListener("click", async ()=>{
+    const name = document.getElementById("groupNameInput").value.trim();
+    if(!name || groupMemberSelection.length===0) return;
+    const btn = document.getElementById("createGroupBtn");
+    btn.disabled = true;
+    try{
+      const data = await api("POST","/api/groups", { name, memberPhones: groupMemberSelection });
+      groupsCache[data.group.id] = data.group;
+      toast("Группа создана");
+      await refreshChatList();
+      screenStack = screenStack.filter(s=>s!=="createGroup");
+      openGroupThread(data.group.id);
+    }catch(e){
+      toast(e.message || "Не удалось создать группу");
+      btn.disabled = false;
+    }
+  });
+
   async function loadFavorites(){
     try{
       const data = await api("GET","/api/favorites");
       favoritesCache = data.messages;
-    }catch(e){ /* тихо игнорируем, не критично для остального интерфейса */ }
+    }catch(e){ }
   }
 
-  /* ============================================================
-     ПРОФИЛЬ
-  ============================================================ */
   function renderProfileScreen(){
     if(!me) return;
     document.getElementById("profileAvatarLg").innerHTML="";
@@ -1067,7 +1485,6 @@
     }catch(e){ toast(e.message); }
   });
 
-  /* ---- смена номера телефона ---- */
   const editPhoneInput = document.getElementById("editPhoneInput");
   document.getElementById("editPhoneRow").addEventListener("click", ()=>{
     editPhoneInput.value="";
@@ -1099,7 +1516,7 @@
       me = data.user;
       session.phone = me.phone;
       saveSession();
-      connectWebSocket(); // переподключаемся под новым номером
+      connectWebSocket();
       renderProfileScreen();
       toast("Номер телефона обновлён");
       screenStack = screenStack.filter(s=>!["editPhone","editPhoneCode"].includes(s));
@@ -1107,9 +1524,8 @@
     }catch(e){ toast(e.message || "Не удалось подтвердить код"); }
   });
 
-  /* ---- фото и цвет профиля ---- */
   let editColorChoice = null;
-  let editAvatarDataUrl = null; // новое фото, если выбрано
+  let editAvatarDataUrl = null;
   let editAvatarRemoved = false;
 
   function renderEditAvatarPreview(){
@@ -1195,7 +1611,6 @@
     }catch(e){ toast(e.message); }
   });
 
-  /* ---- выход из аккаунта ---- */
   function logoutToWelcome(){
     clearSession();
     if(ws) try{ ws.close(); }catch(e){}
@@ -1208,24 +1623,13 @@
     if(confirm("Выйти из аккаунта на этом устройстве?")) logoutToWelcome();
   });
 
-  /* ============================================================
-     АУДИОЗВОНКИ ЧЕРЕЗ WEBRTC
-     Сервер тут выступает только "почтальоном" для служебных сообщений
-     (кто звонит, SDP-предложение/ответ, ICE-кандидаты) — сам звуковой
-     поток после соединения идёт напрямую между браузерами (peer-to-peer),
-     поэтому качество звука не зависит от мощности сервера.
-  ============================================================ */
   const ICE_SERVERS = [{ urls: "stun:stun.l.google.com:19302" }];
-  // ^ публичный STUN-сервер Google — помогает двум браузерам найти друг
-  // друга через NAT. Для звонков между сетями, где STUN не справляется
-  // (строгие корпоративные/мобильные NAT), в реальном продукте дополнительно
-  // нужен TURN-сервер (например, через coturn или платный сервис).
 
   let rtcConn = null;
   let localStream = null;
   let currentCallId = null;
   let currentCallPhone = null;
-  let currentCallRole = null; // "caller" | "callee"
+  let currentCallRole = null;
   let callTimerInterval = null;
   let callStartTs = null;
   let isMuted = false;
@@ -1284,7 +1688,6 @@
 
   function handleIncomingCall(payload){
     if(currentCallId){
-      // Уже в звонке — автоматически отклоняем новый встречный вызов.
       wsSend("call:decline", { toPhone: payload.fromPhone, callId: payload.callId });
       return;
     }
@@ -1317,8 +1720,6 @@
     document.getElementById("callStatus").textContent = "соединение...";
     wsSend("call:accept", { toPhone: currentCallPhone, callId: currentCallId });
     await setupPeerConnection();
-    // У принимающей стороны соединение создаётся, но именно звонящий
-    // первым формирует SDP-предложение (см. handleCallAccepted).
   });
 
   document.getElementById("callDeclineBtn").addEventListener("click", ()=>{
@@ -1412,9 +1813,6 @@
     document.getElementById("callMuteBtn").classList.toggle("active", isMuted);
   });
   document.getElementById("callSpeakerBtn").addEventListener("click", (e)=>{
-    // Переключение "громкой связи" зависит от устройства/браузера и не
-    // всегда программно управляемо через web-API — оставляем как
-    // визуальный тоггл совместимости с системным выводом звука.
     e.currentTarget.classList.toggle("active");
   });
 
@@ -1430,18 +1828,24 @@
     hideCallScreen();
   }
 
-  /* ============================================================
-     СТАРТ ПРИЛОЖЕНИЯ
-  ============================================================ */
   loadSession();
   if(session.phone && session.token){
     api("GET","/api/me").then(async (data)=>{
       me = data.user;
       await loadFavorites();
+      await loadStickers();
       await enterApp();
-    }).catch(()=>{
+    }).catch((e)=>{
+      // Сессия недействительна (например, сервер пересобрался и базу
+      // очистил) — НЕ удаляем номер телефона из памяти браузера, чтобы
+      // человек мог просто заново подтвердить код и не терять историю
+      // переписки с этим же номером в будущем, если база восстановится.
+      const savedPhone = session.phone;
       clearSession();
       screens.welcome.classList.remove("hidden");
+      if(savedPhone){
+        toast("Сессия истекла — войдите снова по своему номеру");
+      }
     });
   } else {
     screens.welcome.classList.remove("hidden");
